@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ImportVerilogInternals.h"
+#include "circt/Support/FVInt.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/symbols/ClassSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
@@ -2241,6 +2242,36 @@ Context::defineFunction(const slang::ast::SubroutineSymbol &subroutine) {
   return success();
 }
 
+LogicalResult
+Context::assignPrimOutputWithDelay(Value outputVal, Value assignment,
+                                   const slang::ast::TimingControl *delay,
+                                   Location loc) {
+  if (delay) {
+    const slang::ast::Expression *delayExpr;
+    if (const auto *delay3 = delay->as_if<slang::ast::Delay3Control>()) {
+      if (delay3->expr2 || delay3->expr3)
+        return mlir::emitError(loc) << "only primitives that specify a "
+                                       "single delay are currently supported.";
+      delayExpr = &delay3->expr1;
+    } else if (const auto *delayControl =
+                   delay->as_if<slang::ast::DelayControl>()) {
+      delayExpr = &delayControl->expr;
+    } else {
+      llvm_unreachable("unexpected delay control type in primitive instance");
+    }
+    auto delayVal = this->convertRvalueExpression(
+        *delayExpr, moore::TimeType::get(getContext()));
+    if (!delayVal)
+      return failure();
+    moore::DelayedContinuousAssignOp::create(builder, loc, outputVal,
+                                             assignment, delayVal);
+  } else {
+    moore::ContinuousAssignOp::create(builder, loc, outputVal, assignment);
+  }
+
+  return success();
+}
+
 /// Convert a primitive instance.
 LogicalResult Context::convertPrimitiveInstance(
     const slang::ast::PrimitiveInstanceSymbol &prim) {
@@ -2346,31 +2377,7 @@ LogicalResult Context::convertNInputPrimitive(
   if (!result)
     return failure();
 
-  if (prim.getDelay()) {
-    const slang::ast::Expression *delayExpr;
-    if (const auto *delay3 =
-            prim.getDelay()->as_if<slang::ast::Delay3Control>()) {
-      if (delay3->expr2 || delay3->expr3)
-        return mlir::emitError(loc) << "only n-input primitives that specify a "
-                                       "single delay are currently supported.";
-      delayExpr = &delay3->expr1;
-    } else if (const auto *delay =
-                   prim.getDelay()->as_if<slang::ast::DelayControl>()) {
-      delayExpr = &delay->expr;
-    } else {
-      llvm_unreachable("unexpected delay control type in primitive instance");
-    }
-    auto delayVal = this->convertRvalueExpression(
-        *delayExpr, moore::TimeType::get(getContext()));
-    if (!delayVal)
-      return failure();
-    moore::DelayedContinuousAssignOp::create(builder, loc, outputVal, result,
-                                             delayVal);
-  } else {
-    moore::ContinuousAssignOp::create(builder, loc, outputVal, result);
-  }
-
-  return success();
+  return assignPrimOutputWithDelay(outputVal, result, prim.getDelay(), loc);
 }
 
 LogicalResult Context::convertNOutputPrimitive(
@@ -2413,40 +2420,16 @@ LogicalResult Context::convertNOutputPrimitive(
   if (!result)
     return failure();
 
-  Value delayVal;
-  if (prim.getDelay()) {
-    const slang::ast::Expression *delayExpr;
-    if (const auto *delay3 =
-            prim.getDelay()->as_if<slang::ast::Delay3Control>()) {
-      if (delay3->expr2 || delay3->expr3)
-        return mlir::emitError(loc)
-               << "only n-output primitives that specify a "
-                  "single delay are currently supported.";
-      delayExpr = &delay3->expr1;
-    } else if (const auto *delay =
-                   prim.getDelay()->as_if<slang::ast::DelayControl>()) {
-      delayExpr = &delay->expr;
-    } else {
-      llvm_unreachable("unexpected delay control type in primitive instance");
-    }
-    delayVal = this->convertRvalueExpression(
-        *delayExpr, moore::TimeType::get(getContext()));
-    if (!delayVal)
-      return failure();
-  }
-
   for (auto outputVal : outputVals) {
     auto dstType = cast<moore::RefType>(outputVal.getType()).getNestedType();
     Value converted = materializeConversion(dstType, result, false, loc);
     if (!converted)
       return failure();
-    if (delayVal) {
-      moore::DelayedContinuousAssignOp::create(builder, loc, outputVal,
-                                               converted, delayVal);
-    } else {
-      moore::ContinuousAssignOp::create(builder, loc, outputVal, converted);
-    }
+    if (failed(assignPrimOutputWithDelay(outputVal, converted, prim.getDelay(),
+                                         loc)))
+      return failure();
   }
+
   return success();
 }
 
@@ -2459,6 +2442,18 @@ LogicalResult Context::convertFixedPrimitive(
 
   if (primName == "pullup" || primName == "pulldown")
     return convertPullGatePrimitive(prim);
+
+  if (primName == "bufif0" || primName == "bufif1" || primName == "notif0" ||
+      primName == "notif1")
+    return convertThreeStateGatePrimitive(prim);
+
+  if (primName == "nmos" || primName == "pmos" || primName == "rnmos" ||
+      primName == "rpmos") {
+    return convertMOSSwitchPrimitive(prim);
+  }
+
+  if (primName == "cmos" || primName == "rcmos")
+    return convertCMOSSwitchPrimitive(prim);
 
   // Remaining fixed primitives still need handling
   mlir::emitError(loc) << "unsupported primitive `" << primName << "`";
@@ -2500,6 +2495,299 @@ LogicalResult Context::convertPullGatePrimitive(
     return failure();
   moore::ContinuousAssignOp::create(builder, loc, portVal, converted);
   return success();
+}
+
+/// Yields `data` unless it is exactly Z, in which case yields X instead.
+/// Per IEEE 1800-2023 Section 28.6's table 28-5 for three-state gates, a Z
+/// data input yields X on either the actively-driven or ambiguous-enable path.
+/// Known 0/1 data values pass through unchanged. For three-state gates this
+/// depends on the assumption that we collapse L to 0 and H to 1.
+static Value collapseZToX(OpBuilder &builder, Location loc, Value data,
+                          Type dstType) {
+  auto dstIntType = cast<moore::IntType>(dstType);
+  Value xVal =
+      moore::ConstantOp::create(builder, loc, dstIntType, FVInt::getAllX(1));
+  Value zVal =
+      moore::ConstantOp::create(builder, loc, dstIntType, FVInt::getAllZ(1));
+
+  auto isZ = moore::CaseEqOp::create(builder, loc, data, zVal);
+  auto condOp = moore::ConditionalOp::create(builder, loc, dstType, isZ);
+  auto &trueBlk = condOp.getTrueRegion().emplaceBlock();
+  auto &falseBlk = condOp.getFalseRegion().emplaceBlock();
+  {
+    OpBuilder::InsertionGuard g(builder);
+    builder.setInsertionPointToStart(&trueBlk);
+    moore::YieldOp::create(builder, loc, xVal);
+    builder.setInsertionPointToStart(&falseBlk);
+    moore::YieldOp::create(builder, loc, data);
+  }
+  return condOp.getResult();
+}
+
+LogicalResult Context::convertThreeStateGatePrimitive(
+    const slang::ast::PrimitiveInstanceSymbol &prim) {
+  auto loc = convertLocation(prim.location);
+  auto primName = prim.primitiveType.name;
+
+  auto portConns = prim.getPortConnections();
+  assert(portConns.size() == 3 &&
+         "Expected exactly 3 ports in three-state gate primitives");
+
+  auto &outputConn =
+      portConns[0]->as<slang::ast::AssignmentExpression>().left();
+  auto outputVal = convertLvalueExpression(outputConn);
+  if (!outputVal)
+    return failure();
+
+  auto inVal = convertRvalueExpression(*portConns[1]);
+  auto enVal = convertRvalueExpression(*portConns[2]);
+  if (!inVal || !enVal)
+    return failure();
+
+  auto enType = cast<moore::IntType>(enVal.getType());
+  auto enWidth = enType.getBitSize();
+  // Slang automatically casts enable signals (or errors if it can't be cast)
+  assert(enWidth && *enWidth == 1 &&
+         "enable signal of a three-state gate primitive must be 1 bit");
+
+  auto dstType = cast<moore::RefType>(outputVal.getType()).getNestedType();
+  auto dstWidth = dstType.getBitSize();
+  if (!dstWidth || *dstWidth != 1)
+    return mlir::emitError(loc)
+           << "output of a three-state gate primitive must be 1 bit";
+
+  if (primName == "notif0" || primName == "notif1")
+    inVal = moore::NotOp::create(builder, loc, inVal);
+
+  inVal = materializeConversion(dstType, inVal, false, loc);
+  if (!inVal)
+    return failure();
+
+  // Value of enable to be considered active or inactive
+  int inactiveLevel = (primName == "bufif1" || primName == "notif1") ? 0 : 1;
+  Value inactiveConst =
+      moore::ConstantOp::create(builder, loc, enType, inactiveLevel, false);
+
+  auto dstIntType = cast<moore::IntType>(dstType);
+  Value zVal =
+      moore::ConstantOp::create(builder, loc, dstIntType, FVInt::getAllZ(1));
+
+  // Compare enable to what we consider inactive (0 or 1 depending on type of
+  // buffer)
+  auto condInactive =
+      moore::CaseEqOp::create(builder, loc, enVal, inactiveConst);
+  auto inactiveOp =
+      moore::ConditionalOp::create(builder, loc, dstType, condInactive);
+  auto &inactiveTrue = inactiveOp.getTrueRegion().emplaceBlock();
+  auto &inactiveFalse = inactiveOp.getFalseRegion().emplaceBlock();
+
+  {
+    OpBuilder::InsertionGuard g(builder);
+    builder.setInsertionPointToStart(&inactiveTrue);
+    moore::YieldOp::create(builder, loc, zVal);
+    builder.setInsertionPointToStart(&inactiveFalse);
+    moore::YieldOp::create(builder, loc,
+                           collapseZToX(builder, loc, inVal, dstType));
+  }
+
+  Value result = inactiveOp.getResult();
+
+  return assignPrimOutputWithDelay(outputVal, result, prim.getDelay(), loc);
+}
+
+LogicalResult Context::convertMOSSwitchPrimitive(
+    const slang::ast::PrimitiveInstanceSymbol &prim) {
+  assert(
+      prim.primitiveType.name == "nmos" || prim.primitiveType.name == "pmos" ||
+      prim.primitiveType.name == "rnmos" || prim.primitiveType.name == "rpmos");
+
+  auto loc = convertLocation(prim.location);
+  auto primName = prim.primitiveType.name;
+
+  auto portConns = prim.getPortConnections();
+
+  assert(portConns.size() == 3 && "mos primitive should have exactly 3 ports");
+
+  auto &outputConn =
+      portConns[0]->as<slang::ast::AssignmentExpression>().left();
+
+  auto outputVal = convertLvalueExpression(outputConn);
+  if (!outputVal)
+    return failure();
+
+  auto inputVal = convertRvalueExpression(*portConns[1]);
+  if (!inputVal)
+    return failure();
+
+  // Slang automatically casts MOS switch inputs to 1-bit logic.
+  assert(cast<moore::IntType>(inputVal.getType()).getBitSize() == 1 &&
+         "MOS switch input must be 1 bit");
+
+  Value controlIsOff;
+
+  auto control = convertRvalueExpression(*portConns[2]);
+  if (!control)
+    return failure();
+
+  auto controlType = cast<moore::IntType>(control.getType());
+  assert(controlType.getBitSize() == 1 && "MOS switch control must be 1 bit");
+
+  int offLevel = (primName == "nmos" || primName == "rnmos") ? 0 : 1;
+  auto offValue = moore::ConstantOp::create(
+      builder, loc, controlType, FVInt(1, static_cast<uint64_t>(offLevel)));
+
+  controlIsOff = moore::CaseEqOp::create(builder, loc, control, offValue);
+  auto dstType = cast<moore::RefType>(outputVal.getType()).getNestedType();
+
+  auto dstIntType = dyn_cast<moore::IntType>(dstType);
+  if (!dstIntType || dstIntType.getBitSize() != 1)
+    return mlir::emitError(loc) << "MOS switch output must be 1 bit";
+
+  auto convertedInput = materializeConversion(dstType, inputVal, false, loc);
+  if (!convertedInput)
+    return failure();
+
+  Value zVal =
+      moore::ConstantOp::create(builder, loc, dstIntType, FVInt::getAllZ(1));
+
+  auto condOp =
+      moore::ConditionalOp::create(builder, loc, dstType, controlIsOff);
+
+  auto &trueBlock = condOp.getTrueRegion().emplaceBlock();
+  auto &falseBlock = condOp.getFalseRegion().emplaceBlock();
+
+  builder.setInsertionPointToStart(&trueBlock);
+  moore::YieldOp::create(builder, loc, zVal);
+
+  builder.setInsertionPointToStart(&falseBlock);
+  moore::YieldOp::create(builder, loc, convertedInput);
+
+  builder.setInsertionPointAfter(condOp);
+
+  return assignPrimOutputWithDelay(outputVal, condOp.getResult(),
+                                   prim.getDelay(), loc);
+}
+
+LogicalResult Context::convertCMOSSwitchPrimitive(
+    const slang::ast::PrimitiveInstanceSymbol &prim) {
+  assert(prim.primitiveType.name == "cmos" ||
+         prim.primitiveType.name == "rcmos");
+
+  auto loc = convertLocation(prim.location);
+  auto portConns = prim.getPortConnections();
+  assert(portConns.size() == 4 && "cmos primitive should have exactly 4 ports");
+
+  auto &outputConn =
+      portConns[0]->as<slang::ast::AssignmentExpression>().left();
+  auto outputVal = convertLvalueExpression(outputConn);
+  if (!outputVal)
+    return failure();
+
+  auto dataVal = convertRvalueExpression(*portConns[1]);
+  if (!dataVal)
+    return failure();
+  // Slang automatically casts CMOS switch inputs to 1-bit logic.
+  assert(cast<moore::IntType>(dataVal.getType()).getBitSize() == 1 &&
+         "CMOS switch input must be 1 bit");
+
+  auto ncontrolVal = convertRvalueExpression(*portConns[2]);
+  if (!ncontrolVal)
+    return failure();
+  assert(cast<moore::IntType>(ncontrolVal.getType()).getBitSize() == 1 &&
+         "CMOS switch ncontrol must be 1 bit");
+
+  auto pcontrolVal = convertRvalueExpression(*portConns[3]);
+  if (!pcontrolVal)
+    return failure();
+  assert(cast<moore::IntType>(pcontrolVal.getType()).getBitSize() == 1 &&
+         "CMOS switch pcontrol must be 1 bit");
+
+  auto dstType = cast<moore::RefType>(outputVal.getType()).getNestedType();
+  auto dstIntType = dyn_cast<moore::IntType>(dstType);
+  if (!dstIntType || dstIntType.getBitSize() != 1)
+    return mlir::emitError(loc) << "CMOS switch output must be 1 bit";
+
+  auto convertedData = materializeConversion(dstType, dataVal, false, loc);
+  if (!convertedData)
+    return failure();
+
+  auto logicType = moore::IntType::getLogic(getContext(), 1);
+
+  auto makeConst = [&](FVInt val) -> Value {
+    Value c = moore::ConstantOp::create(builder, loc, logicType, val);
+    return materializeConversion(dstType, c, false, loc);
+  };
+  Value zVal = makeConst(FVInt::getAllZ(1));
+  Value xVal = makeConst(FVInt::getAllX(1));
+  if (!zVal || !xVal)
+    return failure();
+
+  auto makeLevelConstant = [&](Value value, int level) -> Value {
+    auto type = cast<moore::IntType>(value.getType());
+    return moore::ConstantOp::create(builder, loc, type,
+                                     FVInt(1, static_cast<uint64_t>(level)));
+  };
+
+  auto muxZOrData = [&](Value cond) -> Value {
+    auto condOp = moore::ConditionalOp::create(builder, loc, dstType, cond);
+    auto &trueBlk = condOp.getTrueRegion().emplaceBlock();
+    auto &falseBlk = condOp.getFalseRegion().emplaceBlock();
+    builder.setInsertionPointToStart(&trueBlk);
+    moore::YieldOp::create(builder, loc, zVal);
+    builder.setInsertionPointToStart(&falseBlk);
+    moore::YieldOp::create(builder, loc, convertedData);
+    builder.setInsertionPointAfter(condOp);
+    return condOp.getResult();
+  };
+
+  // N side: behaves like NMOS -- off (Z) when ncontrol === 0.
+  auto nOff = makeLevelConstant(ncontrolVal, 0);
+  auto nIsOff = moore::CaseEqOp::create(builder, loc, ncontrolVal, nOff);
+  Value nResult = muxZOrData(nIsOff);
+
+  // P side: behaves like PMOS -- off (Z) when pcontrol === 1.
+  auto pOff = makeLevelConstant(pcontrolVal, 1);
+  auto pIsOff = moore::CaseEqOp::create(builder, loc, pcontrolVal, pOff);
+  Value pResult = muxZOrData(pIsOff);
+
+  auto agree = moore::CaseEqOp::create(builder, loc, nResult, pResult);
+  auto nIsZ = moore::CaseEqOp::create(builder, loc, nResult, zVal);
+  auto pIsZ = moore::CaseEqOp::create(builder, loc, pResult, zVal);
+
+  auto outerCond = moore::ConditionalOp::create(builder, loc, dstType, agree);
+  auto &outerTrue = outerCond.getTrueRegion().emplaceBlock();
+  auto &outerFalse = outerCond.getFalseRegion().emplaceBlock();
+
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&outerTrue);
+    moore::YieldOp::create(builder, loc, nResult);
+
+    builder.setInsertionPointToStart(&outerFalse);
+    auto middleCond = moore::ConditionalOp::create(builder, loc, dstType, nIsZ);
+    auto &middleTrue = middleCond.getTrueRegion().emplaceBlock();
+    auto &middleFalse = middleCond.getFalseRegion().emplaceBlock();
+    moore::YieldOp::create(builder, loc, middleCond.getResult());
+
+    builder.setInsertionPointToStart(&middleTrue);
+    moore::YieldOp::create(builder, loc, pResult);
+
+    builder.setInsertionPointToStart(&middleFalse);
+    auto innerCond = moore::ConditionalOp::create(builder, loc, dstType, pIsZ);
+    auto &innerTrue = innerCond.getTrueRegion().emplaceBlock();
+    auto &innerFalse = innerCond.getFalseRegion().emplaceBlock();
+
+    builder.setInsertionPointToStart(&innerTrue);
+    moore::YieldOp::create(builder, loc, nResult);
+    builder.setInsertionPointToStart(&innerFalse);
+    moore::YieldOp::create(builder, loc, xVal);
+
+    builder.setInsertionPointAfter(innerCond);
+    moore::YieldOp::create(builder, loc, innerCond.getResult());
+  }
+
+  return assignPrimOutputWithDelay(outputVal, outerCond.getResult(),
+                                   prim.getDelay(), loc);
 }
 
 namespace {
