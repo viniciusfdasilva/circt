@@ -19,7 +19,9 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Debug.h"
 
+#define DEBUG_TYPE "bug-tracking"
 using namespace circt;
 using namespace firrtl;
 
@@ -1096,6 +1098,15 @@ Type circt::firrtl::lowerType(
     return seq::ClockType::get(firType.getContext());
 
   auto width = firType.getBitWidthOrSentinel();
+
+  if (width >= 0 && width > IntegerType::kMaxWidth) {
+    Location errLoc = loc.value_or(UnknownLoc::get(type.getContext()));
+    emitError(errLoc, "integer width ")
+        << width << " exceeds the maximum supported width of "
+        << IntegerType::kMaxWidth;
+    return {};
+  }
+
   if (width >= 0) // IntType, analog with known width, clock, etc.
     return IntegerType::get(type.getContext(), width);
 
